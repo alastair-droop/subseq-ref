@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+version = '1.0 (2017-08-25)'
+
+# Handle broken pipes:
+from signal import signal, SIGPIPE, SIG_DFL
+signal(SIGPIPE, SIG_DFL)
+
+import logging
+import argparse
+import re
+from sys import exit
+import os.path
+import datetime
+
+# Parse the command-line arguments:
+parser = argparse.ArgumentParser(description='Extract a subsequence from a FATSA and GTF file pair')
+parser.add_argument('-v', '--version', action='version', version='%(prog)s {0}'.format(version))
+parser.add_argument('-V', '--verbose', dest='verbosity_level', default='error', choices=['error', 'warning', 'info'], help='Set logging level')
+parser.add_argument('-p', '--padding', dest='padding', type=int, metavar='<n>', default=0, help='padding length')
+parser.add_argument('-n', '--line-length', dest='length', type=int, metavar='<n>', default=80, help='output FASTA line length')
+parser.add_argument('-u', '--update-region', dest='update', action='store_true', default=False, help='update specified region based upon GTF feature overlaps')
+parser.add_argument('-l', '--chr-label', dest='label', metavar='<name>', default=None, help='output chromosome name')
+parser.add_argument('-e', '--extended-header', dest='extended_header', action='store_true', default=False, help='provide extra FASTA header information')
+parser.add_argument('-o', '--output-stem', dest='output', metavar='<stem>', default='', help='output file stem')
+parser.add_argument(dest='region', metavar='<region>', help='region to extract (chr:start-end), 1-based')
+parser.add_argument(dest='gtf', metavar='<GTF>', help='GTF file')
+parser.add_argument(dest='fasta', metavar='<fasta>', help='FASTA file')
+args = parser.parse_args()
+
+# Define the Region class to encapsulate a genomic region:
+class Region(object):
+    string_re = re.compile('(\w+):(\d+)-(\d+)')
+    gtf_re = re.compile('(\w+)\t\w+\t\w+\t(\d+)\t(\d+)')
+    @classmethod
+    def fromString(cls, string):
+        match = re.fullmatch(Region.string_re, string)
+        if match is None: return None
+        return Region(match.group(1), match.group(2), match.group(3))
+    def __init__(self, chromosome, start, end):
+        self.chromosome = chromosome
+        self.start = start
+        self.end = end
+    def getChromosome(self): return self._chromosome
+    def getStart(self): return self._start
+    def getEnd(self): return self._end
+    def setChromosome(self, chromosome): self._chromosome = chromosome
+    def setStart(self, start): self._start = int(start)
+    def setEnd(self, end): self._end = int(end)
+    def overlaps(self, other):
+        if other is None: return False
+        if self.chromosome != other.chromosome: return False
+        if (self.start > other.end) or (self.end < other.start): return False
+        return True
+    def intersection(self, other):
+        if not self.overlaps(other): return None
+        return Region(self.chromosome, max(self.start, other.start), min(self.end, other.end))
+    def extend(self, other):
+        if (other is None) or (self.chromosome != other.chromosome): return
+        self.start = min(self.start, other.start)
+        self.end = max(self.end, other.end)
+    def pad(self, n):
+        self.start = self.start - n
+        self.end = self.end + n
+    def translate(self, n):
+        self.start = self.start + n
+        self.end = self.end + n
+    def maskString(self, string):
+        i = self.start
+        j = self.end + 1
+        if (i > len(string)) or (j < 0): return ''
+        if i <= 0: i = None
+        if j > len(string): j = None
+        return string[i:j]
+    def __str__(self): return '{}:{}-{}'.format(self.chromosome, self.start, self.end)
+    def __repr__(self): return 'Region("{}", {}, {})'.format(self.chromosome, self.start, self.end)
+    chromosome = property(getChromosome, setChromosome)
+    start = property(getStart, setStart)
+    end = property(getEnd, setEnd)
+
+# Create a function to log critical errors and exit:
+def error(message, exit_code=1):
+    log.error(message)
+    exit(exit_code)
+
+# Set up logging based on the verbosity level set by the command line arguments:
+log = logging.getLogger()
+log_handler = logging.StreamHandler()
+log.default_msec_format = ''
+log_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+log.setLevel(args.verbosity_level.upper())
+log.addHandler(log_handler)
+
+# Read in the input region:
+input_region = Region.fromString(args.region)
+if input_region is None: error('invalid region "{}"'.format(args.region))
+log.info('input region is {}'.format(input_region))
+
+# Parse the GTF file:
+gtf_data = []
+selected_region = Region(input_region.chromosome, input_region.start, input_region.end)
+log.info('reading GTF file "{}"'.format(args.gtf))
+try:
+    with open(args.gtf, 'rt') as input_gtf:
+        for line in input_gtf.readlines():
+            if line.startswith('#') or (not line.startswith(input_region.chromosome)): continue
+            line_data = line.split('\t')
+            line_region = Region(chromosome=line_data[0], start=line_data[3], end=line_data[4])
+            if input_region.overlaps(line_region):
+                gtf_data.append(line_data)
+                if args.update is True: selected_region.extend(line_region)
+except: error('failed to process GTF file "{}"'.format(args.gtf))
+if len(gtf_data) == 0: log.warning('no GTF features overlap input region')
+else: log.info('{} GTF feature(s) selected'.format(len(gtf_data)))
+log.info('selected region (before padding) is {}'.format(selected_region))
+
+# Pad the selected region:
+selected_region.pad(args.padding)
+log.info('selected region (after padding) is {}'.format(selected_region))
+
+# Load the FASTA file, and output the required region:
+selected_sequence = []
+log.info('reading FASTA file "{}"'.format(args.fasta))
+try:
+    with open(args.fasta, 'rt') as input_fasta:
+        for line in input_fasta.readlines():
+            if line.startswith('>'):
+                line_region = Region(line.strip().lstrip('>').split()[0], start=0, end=0)
+                continue
+            if line_region.chromosome != selected_region.chromosome: continue
+            line_region.start = line_region.end + 1
+            if line_region.start > selected_region.end: break
+            line_seq = line.strip()
+            line_region.end = line_region.start + len(line_seq) - 1
+            overlap = selected_region.intersection(line_region)
+            if overlap is not None:
+                overlap.translate(-line_region.start)
+                sel_seq = overlap.maskString(line_seq)
+                selected_sequence.append(sel_seq)
+except: error('failed to process FASTA file "{}"'.format(args.fasta))
+selected_sequence = ''.join(selected_sequence)
+
+# Set the default chromosome label, if not otherwise selected:
+if args.label is None: args.label = selected_region.chromosome
+
+# Output the FASTA data:
+fasta_outfile = os.path.join(args.output, '{}.fasta'.format(args.label))
+log.info('writing output FASTA file to "{}"'.format(fasta_outfile))
+try:
+    with open(fasta_outfile, 'wt') as fasta_output:
+        if args.extended_header is True: print('>{} {} padding={} len={}'.format(args.label, selected_region, args.padding, len(selected_sequence)), file=fasta_output)
+        else: print('>{}'.format(args.label), file=fasta_output)
+        for i in range(0, len(selected_sequence), args.length):
+            print(selected_sequence[i:i + args.length], file=fasta_output)
+except: error('failed to write FASTA file "{}"'.format(fasta_outfile))
+
+# Output the GTF data:
+gtf_outfile = os.path.join(args.output, '{}.gtf'.format(args.label))
+log.info('writing output GTF file to "{}"'.format(gtf_outfile))
+try:
+    with open(gtf_outfile, 'wt') as gtf_output:
+        print('##description: GTF subset from "{}"'.format(args.gtf), file=gtf_output)
+        print('##region: {}'.format(selected_region), file=gtf_output)
+        print('##padding: {}'.format(args.padding), file=gtf_output)
+        print('##date: {}'.format(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')), file=gtf_output)
+        print('##format: gtf', file=gtf_output)
+        for line in gtf_data:
+            line[0] = args.label
+            line[3] = str(int(line[3]) - selected_region.start + 1)
+            line[4] = str(int(line[4]) - selected_region.start + 1)
+            print('\t'.join(line), file=gtf_output, end='')
+except: error('failed to write GTF file "{}"'.format(gtf_outfile))
